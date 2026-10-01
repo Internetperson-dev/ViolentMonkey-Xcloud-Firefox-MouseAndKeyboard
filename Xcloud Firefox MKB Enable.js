@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Xcloud Firefox MKB Enable
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  xcloud MKB on Firefox: navigator.keyboard polyfill, targeted pointer-lock keep-alive, chord-click tracing + movement-delta fix
 // @match        *://*.play.xbox.com/*
 // @match        *://*.xbox.com/en-GB/play*
@@ -30,6 +30,8 @@
       __mkb.zeroChordDelta = true   zero movementX/Y on button-change moves
       __mkb.chord = true            synthesize missing pointerdown/up (v5.1 shim)
       __mkb.blockExit = false       disable pointer-lock keep-alive
+      __mkb.blockEscExit = false    stop preventDefault()-ing Escape
+      __mkb.reenterFullscreen = false  stop auto re-entering fullscreen
 */
 
 (function () {
@@ -41,6 +43,8 @@
         chordMouse: false,      // synthetic mousedown/up - off
         zeroChordDelta: true,   // the movement fix
         blockContextMenu: true, // stop right-click menu from stealing focus/keys
+        blockEscExit: true,     // preventDefault() Escape while fullscreen (best effort)
+        reenterFullscreen: true,// if fullscreen is lost anyway, re-enter on next click/key
         trace: true,
         debug: false
     };
@@ -231,14 +235,53 @@
         }
     }, true);
 
-    // ---- 5. Diagnostics ---------------------------------------------------
+    // ---- 5. Escape / fullscreen handling ----------------------------------
+    // Firefox has no Keyboard.lock(), so a page cannot reserve Escape the way it
+    // can in Chromium. Best effort:
+    //   a) preventDefault() Escape while fullscreen (honoured on some Firefox paths)
+    //   b) if fullscreen is lost anyway, re-enter it on your next click/keypress
+    //      (browsers only allow requestFullscreen() from a user gesture, and
+    //      Escape itself never counts as one).
+    const escGuard = (e) => {
+        if (cfg.blockEscExit && e.key === 'Escape' && document.fullscreenElement) e.preventDefault();
+    };
+    ['keydown', 'keypress', 'keyup'].forEach(t => addEventListener(t, escGuard, true));
+
+    let fsTarget = null;
+    let lastF11 = 0;
+    addEventListener('keydown', (e) => { if (e.key === 'F11') lastF11 = performance.now(); }, true);
+
+    const armReenter = () => {
+        const go = (e) => {
+            if (!e.isTrusted || e.key === 'Escape') return;
+            removeEventListener('pointerdown', go, true);
+            removeEventListener('keydown', go, true);
+            if (document.fullscreenElement || !fsTarget) return;
+            if (cfg.debug) console.log('[Xcloud MKB] re-entering fullscreen');
+            try {
+                const r = fsTarget.requestFullscreen();
+                if (r && r.catch) r.catch(err => console.warn('[Xcloud MKB] re-enter failed:', err));
+            } catch (err) { console.warn('[Xcloud MKB] re-enter failed:', err); }
+        };
+        addEventListener('pointerdown', go, true);
+        addEventListener('keydown', go, true);
+    };
+
+    document.addEventListener('fullscreenchange', () => {
+        if (document.fullscreenElement) { fsTarget = document.fullscreenElement; return; }
+        if (cfg.trace) push({ t: now(), type: 'FULLSCREEN EXITED', flag: true });
+        // Respect a deliberate F11 exit
+        if (cfg.reenterFullscreen && fsTarget && performance.now() - lastF11 > 1500) armReenter();
+    });
+
+    // ---- 6. Diagnostics ---------------------------------------------------
     window.__xcloudMKB = () => ({
         keyboardSupported: !!navigator.keyboard,
         isFullscreen: !!document.fullscreenElement,
         pointerLock: document.pointerLockElement?.tagName ?? null,
         config: { ...cfg }
     });
-    const report = () => console.info('[Xcloud MKB v5.3]', JSON.stringify(window.__xcloudMKB()));
+    const report = () => console.info('[Xcloud MKB v5.4]', JSON.stringify(window.__xcloudMKB()));
     addEventListener('pointerlockchange', report);
     addEventListener('fullscreenchange', report);
     setTimeout(report, 1500);
