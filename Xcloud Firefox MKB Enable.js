@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Xcloud Firefox MKB Enable
 // @namespace    http://tampermonkey.net/
-// @version      5.4
-// @description  xcloud MKB on Firefox: navigator.keyboard polyfill, targeted pointer-lock keep-alive, chord-click tracing + movement-delta fix
+// @version      5.5
+// @description  xcloud MKB on Firefox: navigator.keyboard polyfill, targeted pointer-lock keep-alive, chord-click tracing + movement-delta fix + Escape remapping
 // @match        *://*.play.xbox.com/*
 // @match        *://*.xbox.com/en-GB/play*
 // @match        *://assets.play.xbox.com/*
@@ -11,11 +11,8 @@
 // ==/UserScript==
 
 /*
-  v5.2
-  Symptom: view moves when LEFT is pressed while RIGHT is held.
-  Hypothesis: Firefox fires a pointermove/mousemove for the button change that
-  carries a non-zero movementX/Y (stray or duplicated delta) which xCloud counts
-  as real motion.
+  v5.4
+  Added Escape key remapping feature (` default mapped to Escape).
 
   Console helpers (press Esc / alt-tab to reach the console, then click back
   into the stream to re-lock):
@@ -27,11 +24,11 @@
       __mkb.clear()             empty the trace buffer
 
   Experiment toggles:
+      __mkb.remapEscape = true      enable/disable key remapping
+      __mkb.remapFrom = 'Backquote' key code to trigger Escape
       __mkb.zeroChordDelta = true   zero movementX/Y on button-change moves
       __mkb.chord = true            synthesize missing pointerdown/up (v5.1 shim)
       __mkb.blockExit = false       disable pointer-lock keep-alive
-      __mkb.blockEscExit = false    stop preventDefault()-ing Escape
-      __mkb.reenterFullscreen = false  stop auto re-entering fullscreen
 */
 
 (function () {
@@ -43,8 +40,8 @@
         chordMouse: false,      // synthetic mousedown/up - off
         zeroChordDelta: true,   // the movement fix
         blockContextMenu: true, // stop right-click menu from stealing focus/keys
-        blockEscExit: true,     // preventDefault() Escape while fullscreen (best effort)
-        reenterFullscreen: true,// if fullscreen is lost anyway, re-enter on next click/key
+        remapEscape: true,      // remap key to Escape
+        remapFrom: 'Backquote', // backtick/grave key (`) code
         trace: true,
         debug: false
     };
@@ -84,7 +81,27 @@
     guard(Document.prototype, 'exitPointerLock');
     guard(Document.prototype, 'webkitExitPointerLock');
 
-    // ---- 3. Trace buffer + movement-delta fix -----------------------------
+    // ---- 3. Key Remapping (Escape Remap) ----------------------------------
+    const dispatchRemappedKey = (e, targetCode, targetKey) => {
+        const synthEvent = new KeyboardEvent(e.type, {
+            key: targetKey,
+            code: targetCode,
+            keyCode: targetKey === 'Escape' ? 27 : e.keyCode,
+            which: targetKey === 'Escape' ? 27 : e.which,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            repeat: e.repeat,
+            shiftKey: e.shiftKey,
+            altKey: e.altKey,
+            ctrlKey: e.ctrlKey,
+            metaKey: e.metaKey
+        });
+        (e.target || window).dispatchEvent(synthEvent);
+    };
+
+    // ---- 4. Trace buffer + movement-delta fix -----------------------------
     const MOVE = ['pointermove', 'mousemove', 'pointerrawupdate'];
     const BTN = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu', 'click', 'auxclick'];
     const T0 = performance.now();
@@ -128,6 +145,14 @@
 
     const keysDown = new Set();
     const onKey = (e) => {
+        // Intercept configured remap key (` / Backquote by default)
+        if (cfg.remapEscape && e.code === cfg.remapFrom && e.isTrusted) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            dispatchRemappedKey(e, 'Escape', 'Escape');
+            return;
+        }
+
         if (e.type === 'keydown') {
             if (e.repeat) return;
             keysDown.add(e.code);
@@ -136,6 +161,7 @@
         }
         if (cfg.trace) push({ t: now(), type: e.type, key: e.code, held: [...keysDown].join('+'), trusted: e.isTrusted, flag: true });
     };
+
     ['keydown', 'keyup'].forEach(t => addEventListener(t, onKey, true));
     ['blur', 'focus'].forEach(t => addEventListener(t, (e) => {
         if (e.target === window || e.target === document) {
@@ -205,7 +231,7 @@
         return out;
     };
 
-    // ---- 4. Optional chord shim (v5.1) ------------------------------------
+    // ---- 5. Optional chord shim (v5.1) ------------------------------------
     const BIT_TO_BUTTON = { 1: 0, 4: 1, 2: 2, 8: 3, 16: 4 };
     let prev = 0;
     const sync = (e) => { if (e.isTrusted) prev = e.buttons; };
@@ -234,45 +260,6 @@
             if (cfg.chordMouse) target.dispatchEvent(new MouseEvent(down ? 'mousedown' : 'mouseup', init));
         }
     }, true);
-
-    // ---- 5. Escape / fullscreen handling ----------------------------------
-    // Firefox has no Keyboard.lock(), so a page cannot reserve Escape the way it
-    // can in Chromium. Best effort:
-    //   a) preventDefault() Escape while fullscreen (honoured on some Firefox paths)
-    //   b) if fullscreen is lost anyway, re-enter it on your next click/keypress
-    //      (browsers only allow requestFullscreen() from a user gesture, and
-    //      Escape itself never counts as one).
-    const escGuard = (e) => {
-        if (cfg.blockEscExit && e.key === 'Escape' && document.fullscreenElement) e.preventDefault();
-    };
-    ['keydown', 'keypress', 'keyup'].forEach(t => addEventListener(t, escGuard, true));
-
-    let fsTarget = null;
-    let lastF11 = 0;
-    addEventListener('keydown', (e) => { if (e.key === 'F11') lastF11 = performance.now(); }, true);
-
-    const armReenter = () => {
-        const go = (e) => {
-            if (!e.isTrusted || e.key === 'Escape') return;
-            removeEventListener('pointerdown', go, true);
-            removeEventListener('keydown', go, true);
-            if (document.fullscreenElement || !fsTarget) return;
-            if (cfg.debug) console.log('[Xcloud MKB] re-entering fullscreen');
-            try {
-                const r = fsTarget.requestFullscreen();
-                if (r && r.catch) r.catch(err => console.warn('[Xcloud MKB] re-enter failed:', err));
-            } catch (err) { console.warn('[Xcloud MKB] re-enter failed:', err); }
-        };
-        addEventListener('pointerdown', go, true);
-        addEventListener('keydown', go, true);
-    };
-
-    document.addEventListener('fullscreenchange', () => {
-        if (document.fullscreenElement) { fsTarget = document.fullscreenElement; return; }
-        if (cfg.trace) push({ t: now(), type: 'FULLSCREEN EXITED', flag: true });
-        // Respect a deliberate F11 exit
-        if (cfg.reenterFullscreen && fsTarget && performance.now() - lastF11 > 1500) armReenter();
-    });
 
     // ---- 6. Diagnostics ---------------------------------------------------
     window.__xcloudMKB = () => ({
